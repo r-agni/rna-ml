@@ -8,8 +8,8 @@ from tqdm import tqdm
 import numpy as np
 from sklearn.metrics import f1_score, matthews_corrcoef
 
-from model import create_lyra_model
-from data_loader import get_data_loaders
+from .model import create_lyra_model
+from .data_loader import get_data_loaders
 
 
 class MetricsCalculator:
@@ -364,7 +364,7 @@ def main():
     print()
     
     # Load configuration
-    config_path = os.path.join('config', 'config.yaml')
+    config_path = os.path.join('lyra', 'config', 'config.yaml')
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 

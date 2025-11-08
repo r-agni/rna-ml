@@ -3,8 +3,8 @@ import yaml
 import torch
 import numpy as np
 import pandas as pd
-from model import create_lyra_model
-from data_loader import RNADataset
+from .model import create_lyra_model
+from .data_loader import RNADataset
 
 
 class RNAPredictor:
