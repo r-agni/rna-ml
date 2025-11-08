@@ -23,6 +23,15 @@ class RNADataset(Dataset):
 
         if indices is not None:
             self.df = self.df.iloc[indices].reset_index(drop=True)
+        
+        # Filter out invalid rows (where sequence is not a string or is NaN)
+        initial_len = len(self.df)
+        self.df = self.df[self.df['sequence'].apply(lambda x: isinstance(x, str) and pd.notna(x))]
+        self.df = self.df.reset_index(drop=True)
+        
+        filtered_count = initial_len - len(self.df)
+        if filtered_count > 0:
+            print(f"  Filtered out {filtered_count} invalid sequences from dataset")
 
         # Nucleotide to index mapping for one-hot encoding
         self.nuc_to_idx = {'A': 0, 'C': 1, 'G': 2, 'U': 3}

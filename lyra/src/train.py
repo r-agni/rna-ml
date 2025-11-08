@@ -10,6 +10,7 @@ from sklearn.metrics import f1_score, matthews_corrcoef
 
 from .model import create_lyra_model
 from .data_loader import get_data_loaders
+from .wandb_logging import WandBLogger
 
 
 class MetricsCalculator:
@@ -74,15 +75,17 @@ class MetricsCalculator:
 class Trainer:
     """Trainer class for Lyra RNA contact prediction"""
 
-    def __init__(self, config):
+    def __init__(self, config, wandb_logger=None):
         self.config = config
+        self.wandb_logger = wandb_logger
         self.device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
 
         print(f"Using device: {self.device}")
 
         # Create model
         self.model = create_lyra_model(config['model']).to(self.device)
-        print(f"Model created with {sum(p.numel() for p in self.model.parameters())} parameters")
+        num_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Model created with {num_params} parameters")
 
         # Loss function with positive class weighting
         pos_weight = torch.tensor([config['training']['pos_weight']]).to(self.device)
@@ -117,6 +120,12 @@ class Trainer:
         self.train_losses = []
         self.val_losses = []
         self.val_metrics = []
+        
+        # Log model architecture to wandb
+        if self.wandb_logger and self.wandb_logger.is_enabled:
+            self.wandb_logger.log_model_info(
+                self.model, self.criterion, num_params, self.device
+            )
 
     def train_epoch(self, train_loader, epoch):
         """Train for one epoch"""
@@ -142,8 +151,9 @@ class Trainer:
             loss.backward()
 
             # Gradient clipping
+            grad_norm = 0
             if self.config['training']['grad_clip'] > 0:
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.config['training']['grad_clip']
                 )
@@ -155,6 +165,17 @@ class Trainer:
 
             # Update progress bar
             pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            
+            # Log to wandb per batch
+            if self.wandb_logger and self.wandb_logger.is_enabled:
+                self.wandb_logger.log_batch_metrics(
+                    epoch=epoch,
+                    batch_idx=batch_idx,
+                    total_batches=len(train_loader),
+                    loss=loss.item(),
+                    grad_norm=grad_norm,
+                    learning_rate=self.optimizer.param_groups[0]['lr']
+                )
 
             # Log interval
             if self.config['logging']['verbose'] and batch_idx % self.config['logging']['log_interval'] == 0:
@@ -206,8 +227,11 @@ class Trainer:
         # Average metrics
         avg_loss = total_loss / batch_count
         avg_metrics = {key: np.mean(values) for key, values in all_metrics.items()}
+        
+        # Log standard deviations for metrics
+        std_metrics = {key: np.std(values) for key, values in all_metrics.items()}
 
-        return avg_loss, avg_metrics
+        return avg_loss, avg_metrics, std_metrics
 
     def save_checkpoint(self, epoch, val_metric, is_best=False, periodic=False):
         """Save model checkpoint"""
@@ -286,7 +310,7 @@ class Trainer:
             self.train_losses.append(train_loss)
 
             # Validate
-            val_loss, val_metrics = self.validate(val_loader, epoch)
+            val_loss, val_metrics, val_std_metrics = self.validate(val_loader, epoch)
             self.val_losses.append(val_loss)
             self.val_metrics.append(val_metrics)
 
@@ -294,9 +318,24 @@ class Trainer:
             print(f"\nEpoch {epoch} Summary:")
             print(f"  Train Loss: {train_loss:.4f}")
             print(f"  Val Loss:   {val_loss:.4f}")
-            print(f"  Val F1:     {val_metrics['f1']:.4f}")
-            print(f"  Val MCC:    {val_metrics['mcc']:.4f}")
-            print(f"  Val Exact:  {val_metrics['exact_match']:.4f}")
+            print(f"  Val F1:     {val_metrics['f1']:.4f} ± {val_std_metrics['f1']:.4f}")
+            print(f"  Val MCC:    {val_metrics['mcc']:.4f} ± {val_std_metrics['mcc']:.4f}")
+            print(f"  Val Exact:  {val_metrics['exact_match']:.4f} ± {val_std_metrics['exact_match']:.4f}")
+
+            # Get current learning rate
+            current_lr = self.optimizer.param_groups[0]['lr']
+
+            # Log epoch metrics to wandb
+            if self.wandb_logger and self.wandb_logger.is_enabled:
+                self.wandb_logger.log_epoch_metrics(
+                    epoch=epoch,
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    val_metrics=val_metrics,
+                    val_std_metrics=val_std_metrics,
+                    learning_rate=current_lr,
+                    epochs_without_improvement=self.epochs_without_improvement
+                )
 
             # Check for improvement
             monitor_metric = self.config['checkpoint']['monitor']
@@ -304,9 +343,14 @@ class Trainer:
 
             is_best = current_metric > self.best_val_metric
             if is_best:
+                prev_best = self.best_val_metric
                 self.best_val_metric = current_metric
                 self.epochs_without_improvement = 0
-                print(f"  New best {monitor_metric}: {current_metric:.4f}")
+                print(f"  New best {monitor_metric}: {current_metric:.4f} (previous: {prev_best:.4f})")
+                
+                # Log best metric to wandb
+                if self.wandb_logger and self.wandb_logger.is_enabled:
+                    self.wandb_logger.log_best_metric(monitor_metric, current_metric, epoch)
             else:
                 self.epochs_without_improvement += 1
                 print(f"  No improvement for {self.epochs_without_improvement} epochs")
@@ -324,17 +368,31 @@ class Trainer:
 
             # Learning rate scheduler
             if self.scheduler is not None:
+                prev_lr = current_lr
                 self.scheduler.step(current_metric)
                 current_lr = self.optimizer.param_groups[0]['lr']
                 print(f"  Learning Rate: {current_lr:.6f}")
+                
+                # Log LR change to wandb
+                if self.wandb_logger and self.wandb_logger.is_enabled and current_lr != prev_lr:
+                    self.wandb_logger.log_lr_reduction(epoch, current_lr)
 
             # Early stopping
             if self.epochs_without_improvement >= patience:
                 print(f"\nEarly stopping triggered after {epoch} epochs")
+                if self.wandb_logger and self.wandb_logger.is_enabled:
+                    self.wandb_logger.log_early_stopping(epoch, epoch * len(train_loader))
                 break
 
         print(f"\nTraining completed!")
         print(f"Best {monitor_metric}: {self.best_val_metric:.4f}")
+        
+        # Log final training statistics
+        if self.wandb_logger and self.wandb_logger.is_enabled:
+            self.wandb_logger.log_training_completion(
+                len(self.train_losses), 
+                len(self.train_losses) * len(train_loader)
+            )
         
         # Save training history to CSV
         self.save_training_history()
@@ -371,6 +429,11 @@ def main():
     print("Configuration loaded:")
     print(yaml.dump(config, default_flow_style=False))
 
+    # Initialize wandb logger
+    wandb_config = config.get('wandb', {})
+    use_wandb = wandb_config.get('enabled', True)
+    wandb_logger = WandBLogger(config, enabled=use_wandb)
+
     # Create data loaders
     print("\nPreparing data...")
     train_loader, val_loader, test_loader = get_data_loaders(
@@ -382,21 +445,30 @@ def main():
         test_ratio=config['data']['test_ratio'],
         random_seed=config['data']['random_seed']
     )
+    
+    # Log dataset info to wandb
+    if wandb_logger.is_enabled:
+        wandb_logger.log_dataset_info(train_loader, val_loader, test_loader)
 
     # Create trainer
-    trainer = Trainer(config)
+    trainer = Trainer(config, wandb_logger=wandb_logger)
 
     # Train model
     trainer.train(train_loader, val_loader)
 
     # Test on test set
     print("\nEvaluating on test set...")
-    test_loss, test_metrics = trainer.validate(test_loader, "Test")
+    test_loss, test_metrics, test_std_metrics = trainer.validate(test_loader, "Test")
     print(f"\nTest Set Results:")
     print(f"  Test Loss:   {test_loss:.4f}")
-    print(f"  Test F1:     {test_metrics['f1']:.4f}")
-    print(f"  Test MCC:    {test_metrics['mcc']:.4f}")
-    print(f"  Test Exact:  {test_metrics['exact_match']:.4f}")
+    print(f"  Test F1:     {test_metrics['f1']:.4f} ± {test_std_metrics['f1']:.4f}")
+    print(f"  Test MCC:    {test_metrics['mcc']:.4f} ± {test_std_metrics['mcc']:.4f}")
+    print(f"  Test Exact:  {test_metrics['exact_match']:.4f} ± {test_std_metrics['exact_match']:.4f}")
+    
+    # Log test metrics to wandb
+    if wandb_logger.is_enabled:
+        wandb_logger.log_test_metrics(test_loss, test_metrics, test_std_metrics)
+        wandb_logger.finish()
 
 
 if __name__ == '__main__':

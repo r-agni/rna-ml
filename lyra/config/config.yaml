@@ -1,5 +1,17 @@
 # Lyra RNA Secondary Structure Prediction Configuration
 
+# Weights & Biases Configuration
+wandb:
+  enabled: true
+  entity: null  # Set to your wandb team name, or leave as null for personal account
+  project: "lyra-rna-contact-prediction"
+  run_name: null  # Set to null for auto-generated name
+  tags:
+    - "rna"
+    - "contact-prediction"
+    - "transformer"
+  notes: "RNA contact map prediction with Lyra model"
+
 # Data paths
 data:
   csv_path: "lyra/dataset.csv"
