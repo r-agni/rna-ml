@@ -1,0 +1,61 @@
+# Lyra RNA Secondary Structure Prediction Configuration
+
+# Data paths
+data:
+  csv_path: "dataset.csv"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  random_seed: 42
+
+# Data loading
+dataloader:
+  batch_size: 16
+  num_workers: 0
+  pin_memory: true
+
+# Model architecture
+model:
+  model_dimension: 128
+  pgc_configs:
+    - [2.0, 2]  # (expansion_factor, num_layers)
+  num_s4: 4
+  d_input: 4  # One-hot encoding for A, C, G, U
+  dropout: 0.2
+  prenorm: true
+  final_dropout: 0.2
+
+# Training
+training:
+  num_epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  early_stopping_patience: 10
+
+  # Loss function
+  pos_weight: 10.0  # Weight for positive class (base pairs are sparse)
+
+  # Learning rate scheduler
+  scheduler:
+    type: "ReduceLROnPlateau"
+    mode: "max"
+    factor: 0.5
+    patience: 5
+    min_lr: 0.00001
+
+# Checkpointing
+checkpoint:
+  save_dir: "models/checkpoints"
+  save_best_only: false  # Save periodic checkpoints
+  save_interval: 5  # Save checkpoint every N epochs
+  monitor: "val_f1"  # Metric to monitor for best model
+  history_file: "training_history.csv"  # CSV file for loss/metrics tracking
+
+# Device
+device: "cuda"  # "cuda" or "cpu"
+
+# Logging
+logging:
+  log_interval: 100  # Log every N batches
+  verbose: true

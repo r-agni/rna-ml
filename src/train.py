@@ -1,0 +1,403 @@
+import os
+import csv
+import yaml
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+import numpy as np
+from sklearn.metrics import f1_score, matthews_corrcoef
+
+from model import create_lyra_model
+from data_loader import get_data_loaders
+
+
+class MetricsCalculator:
+    """Calculate evaluation metrics for contact map prediction"""
+
+    @staticmethod
+    def calculate_metrics(pred_contacts, true_contacts, seq_lens, threshold=0.5):
+        """
+        Calculate F1, MCC, and exact match accuracy.
+
+        Args:
+            pred_contacts: Predicted contact maps (B, L, L)
+            true_contacts: True contact maps (B, L, L)
+            seq_lens: Actual sequence lengths (B,)
+            threshold: Threshold for binary prediction
+
+        Returns:
+            dict with metrics: f1, mcc, exact_match
+        """
+        batch_size = pred_contacts.shape[0]
+
+        # Binarize predictions
+        pred_binary = (pred_contacts > threshold).float()
+
+        all_preds = []
+        all_trues = []
+        exact_matches = 0
+
+        for i in range(batch_size):
+            seq_len = seq_lens[i].item()
+
+            # Extract valid region (upper triangle to avoid double counting)
+            pred_valid = pred_binary[i, :seq_len, :seq_len].triu(diagonal=1)
+            true_valid = true_contacts[i, :seq_len, :seq_len].triu(diagonal=1)
+
+            # Flatten
+            pred_flat = pred_valid.flatten().cpu().numpy()
+            true_flat = true_valid.flatten().cpu().numpy()
+
+            all_preds.extend(pred_flat)
+            all_trues.extend(true_flat)
+
+            # Check exact match
+            if np.array_equal(pred_flat, true_flat):
+                exact_matches += 1
+
+        # Calculate metrics
+        all_preds = np.array(all_preds)
+        all_trues = np.array(all_trues)
+
+        f1 = f1_score(all_trues, all_preds, zero_division=0)
+        mcc = matthews_corrcoef(all_trues, all_preds)
+        exact_match = exact_matches / batch_size
+
+        return {
+            'f1': f1,
+            'mcc': mcc,
+            'exact_match': exact_match
+        }
+
+
+class Trainer:
+    """Trainer class for Lyra RNA contact prediction"""
+
+    def __init__(self, config):
+        self.config = config
+        self.device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
+
+        print(f"Using device: {self.device}")
+
+        # Create model
+        self.model = create_lyra_model(config['model']).to(self.device)
+        print(f"Model created with {sum(p.numel() for p in self.model.parameters())} parameters")
+
+        # Loss function with positive class weighting
+        pos_weight = torch.tensor([config['training']['pos_weight']]).to(self.device)
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        # Optimizer
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=config['training']['learning_rate'],
+            weight_decay=config['training']['weight_decay']
+        )
+
+        # Learning rate scheduler
+        scheduler_config = config['training']['scheduler']
+        if scheduler_config['type'] == 'ReduceLROnPlateau':
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode=scheduler_config['mode'],
+                factor=scheduler_config['factor'],
+                patience=scheduler_config['patience'],
+                min_lr=scheduler_config['min_lr']
+            )
+        else:
+            self.scheduler = None
+
+        # Metrics
+        self.metrics_calc = MetricsCalculator()
+
+        # Tracking
+        self.best_val_metric = -float('inf')
+        self.epochs_without_improvement = 0
+        self.train_losses = []
+        self.val_losses = []
+        self.val_metrics = []
+
+    def train_epoch(self, train_loader, epoch):
+        """Train for one epoch"""
+        self.model.train()
+        total_loss = 0
+        batch_count = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]")
+        for batch_idx, batch in enumerate(pbar):
+            # Move to device
+            sequences = batch['sequence'].to(self.device)
+            contact_matrices = batch['contact_matrix'].to(self.device)
+            seq_lens = batch['seq_len'].to(self.device)
+
+            # Forward pass
+            self.optimizer.zero_grad()
+            pred_contacts = self.model(sequences, seq_lens)
+
+            # Calculate loss (using logits)
+            loss = self.criterion(pred_contacts, contact_matrices)
+
+            # Backward pass
+            loss.backward()
+
+            # Gradient clipping
+            if self.config['training']['grad_clip'] > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config['training']['grad_clip']
+                )
+
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            batch_count += 1
+
+            # Update progress bar
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+
+            # Log interval
+            if self.config['logging']['verbose'] and batch_idx % self.config['logging']['log_interval'] == 0:
+                avg_loss = total_loss / batch_count
+                print(f"\nBatch {batch_idx}/{len(train_loader)} - Loss: {avg_loss:.4f}")
+
+        avg_loss = total_loss / batch_count
+        return avg_loss
+
+    def validate(self, val_loader, epoch):
+        """Validate the model"""
+        self.model.eval()
+        total_loss = 0
+        batch_count = 0
+
+        all_metrics = {'f1': [], 'mcc': [], 'exact_match': []}
+
+        pbar = tqdm(val_loader, desc=f"Epoch {epoch} [Val]")
+        with torch.no_grad():
+            for batch in pbar:
+                # Move to device
+                sequences = batch['sequence'].to(self.device)
+                contact_matrices = batch['contact_matrix'].to(self.device)
+                seq_lens = batch['seq_len'].to(self.device)
+
+                # Forward pass
+                pred_contacts = self.model(sequences, seq_lens)
+
+                # Calculate loss
+                loss = self.criterion(pred_contacts, contact_matrices)
+                total_loss += loss.item()
+                batch_count += 1
+
+                # Calculate metrics (apply sigmoid for probabilities)
+                pred_probs = torch.sigmoid(pred_contacts)
+                metrics = self.metrics_calc.calculate_metrics(
+                    pred_probs, contact_matrices, seq_lens
+                )
+
+                for key in all_metrics:
+                    all_metrics[key].append(metrics[key])
+
+                # Update progress bar
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'f1': f"{metrics['f1']:.4f}"
+                })
+
+        # Average metrics
+        avg_loss = total_loss / batch_count
+        avg_metrics = {key: np.mean(values) for key, values in all_metrics.items()}
+
+        return avg_loss, avg_metrics
+
+    def save_checkpoint(self, epoch, val_metric, is_best=False, periodic=False):
+        """Save model checkpoint"""
+        checkpoint_dir = self.config['checkpoint']['save_dir']
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'val_metric': val_metric,
+            'config': self.config
+        }
+
+        if is_best:
+            path = os.path.join(checkpoint_dir, 'best_model.pt')
+            torch.save(checkpoint, path)
+            print(f"  Best model saved to {path}")
+
+        # Save periodic checkpoint with epoch number
+        if periodic:
+            path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
+            torch.save(checkpoint, path)
+            print(f"  Checkpoint saved to {path}")
+
+        # Save latest checkpoint
+        path = os.path.join(checkpoint_dir, 'latest_model.pt')
+        torch.save(checkpoint, path)
+
+    def save_training_history(self):
+        """Save training history to CSV file"""
+        checkpoint_dir = self.config['checkpoint']['save_dir']
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        history_file = os.path.join(checkpoint_dir, self.config['checkpoint']['history_file'])
+        
+        with open(history_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Write header
+            writer.writerow([
+                'epoch', 'train_loss', 'val_loss', 
+                'val_f1', 'val_mcc', 'val_exact_match', 'learning_rate'
+            ])
+            
+            # Write data for each epoch
+            for epoch in range(len(self.train_losses)):
+                lr = self.optimizer.param_groups[0]['lr']
+                writer.writerow([
+                    epoch + 1,
+                    f"{self.train_losses[epoch]:.6f}",
+                    f"{self.val_losses[epoch]:.6f}",
+                    f"{self.val_metrics[epoch]['f1']:.6f}",
+                    f"{self.val_metrics[epoch]['mcc']:.6f}",
+                    f"{self.val_metrics[epoch]['exact_match']:.6f}",
+                    f"{lr:.8f}"
+                ])
+        
+        print(f"\nTraining history saved to {history_file}")
+
+    def train(self, train_loader, val_loader):
+        """Full training loop"""
+        num_epochs = self.config['training']['num_epochs']
+        patience = self.config['training']['early_stopping_patience']
+
+        print(f"\nStarting training for {num_epochs} epochs...")
+        print(f"Monitor metric: {self.config['checkpoint']['monitor']}")
+
+        for epoch in range(1, num_epochs + 1):
+            print(f"\n{'=' * 60}")
+            print(f"Epoch {epoch}/{num_epochs}")
+            print(f"{'=' * 60}")
+
+            # Train
+            train_loss = self.train_epoch(train_loader, epoch)
+            self.train_losses.append(train_loss)
+
+            # Validate
+            val_loss, val_metrics = self.validate(val_loader, epoch)
+            self.val_losses.append(val_loss)
+            self.val_metrics.append(val_metrics)
+
+            # Print epoch summary
+            print(f"\nEpoch {epoch} Summary:")
+            print(f"  Train Loss: {train_loss:.4f}")
+            print(f"  Val Loss:   {val_loss:.4f}")
+            print(f"  Val F1:     {val_metrics['f1']:.4f}")
+            print(f"  Val MCC:    {val_metrics['mcc']:.4f}")
+            print(f"  Val Exact:  {val_metrics['exact_match']:.4f}")
+
+            # Check for improvement
+            monitor_metric = self.config['checkpoint']['monitor']
+            current_metric = val_metrics[monitor_metric.replace('val_', '')]
+
+            is_best = current_metric > self.best_val_metric
+            if is_best:
+                self.best_val_metric = current_metric
+                self.epochs_without_improvement = 0
+                print(f"  New best {monitor_metric}: {current_metric:.4f}")
+            else:
+                self.epochs_without_improvement += 1
+                print(f"  No improvement for {self.epochs_without_improvement} epochs")
+
+            # Save checkpoint
+            save_interval = self.config['checkpoint']['save_interval']
+            is_periodic = (epoch % save_interval == 0)
+            
+            if self.config['checkpoint']['save_best_only']:
+                if is_best:
+                    self.save_checkpoint(epoch, current_metric, is_best=True)
+            else:
+                # Save periodic checkpoints and best model
+                self.save_checkpoint(epoch, current_metric, is_best=is_best, periodic=is_periodic)
+
+            # Learning rate scheduler
+            if self.scheduler is not None:
+                self.scheduler.step(current_metric)
+                current_lr = self.optimizer.param_groups[0]['lr']
+                print(f"  Learning Rate: {current_lr:.6f}")
+
+            # Early stopping
+            if self.epochs_without_improvement >= patience:
+                print(f"\nEarly stopping triggered after {epoch} epochs")
+                break
+
+        print(f"\nTraining completed!")
+        print(f"Best {monitor_metric}: {self.best_val_metric:.4f}")
+        
+        # Save training history to CSV
+        self.save_training_history()
+
+
+def main():
+    """Main training function"""
+    # Check CUDA availability
+    print("=" * 60)
+    print("CUDA/GPU Information:")
+    print("=" * 60)
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"Number of GPUs: {torch.cuda.device_count()}")
+        print(f"Current GPU: {torch.cuda.current_device()}")
+        print(f"GPU Name: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    else:
+        print("WARNING: CUDA is not available. Training will use CPU.")
+        print("To use GPU, ensure you have:")
+        print("  1. A CUDA-capable GPU")
+        print("  2. PyTorch installed with CUDA support")
+        print("  3. Compatible CUDA drivers installed")
+    print("=" * 60)
+    print()
+    
+    # Load configuration
+    config_path = os.path.join('config', 'config.yaml')
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    print("Configuration loaded:")
+    print(yaml.dump(config, default_flow_style=False))
+
+    # Create data loaders
+    print("\nPreparing data...")
+    train_loader, val_loader, test_loader = get_data_loaders(
+        csv_path=config['data']['csv_path'],
+        batch_size=config['dataloader']['batch_size'],
+        num_workers=config['dataloader']['num_workers'],
+        train_ratio=config['data']['train_ratio'],
+        val_ratio=config['data']['val_ratio'],
+        test_ratio=config['data']['test_ratio'],
+        random_seed=config['data']['random_seed']
+    )
+
+    # Create trainer
+    trainer = Trainer(config)
+
+    # Train model
+    trainer.train(train_loader, val_loader)
+
+    # Test on test set
+    print("\nEvaluating on test set...")
+    test_loss, test_metrics = trainer.validate(test_loader, "Test")
+    print(f"\nTest Set Results:")
+    print(f"  Test Loss:   {test_loss:.4f}")
+    print(f"  Test F1:     {test_metrics['f1']:.4f}")
+    print(f"  Test MCC:    {test_metrics['mcc']:.4f}")
+    print(f"  Test Exact:  {test_metrics['exact_match']:.4f}")
+
+
+if __name__ == '__main__':
+    main()
