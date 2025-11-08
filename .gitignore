@@ -54,3 +54,6 @@ Thumbs.db
 
 # Environment variables
 .env
+
+# Weights & Biases local runs
+wandb/
