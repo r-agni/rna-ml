@@ -180,7 +180,8 @@ class CombinedLoss(nn.Module):
 
     def __init__(self, focal_alpha=0.25, focal_gamma=2.0, dice_weight=0.3):
         super().__init__()
-        self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='mean')
+        # Use reduction='none' to match other loss functions for consistent masking
+        self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none')
         self.dice_loss = DiceLoss(smooth=1.0)
         self.dice_weight = dice_weight
 
@@ -191,9 +192,12 @@ class CombinedLoss(nn.Module):
             targets: Ground truth binary labels (B, L, L)
 
         Returns:
-            Combined loss value
+            Combined loss value (element-wise for focal, scalar for dice)
         """
+        # Focal loss returns element-wise loss (B, L, L) with reduction='none'
         focal = self.focal_loss(inputs, targets)
+        # Dice loss returns scalar
         dice = self.dice_loss(inputs, targets)
 
+        # Return element-wise focal + scalar dice (broadcasting adds dice to all elements)
         return focal + self.dice_weight * dice

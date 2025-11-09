@@ -37,6 +37,10 @@ class RNADataset(Dataset):
         if filtered_count > 0:
             print(f"  Filtered out {filtered_count} invalid sequences from dataset")
 
+        # Ensure dataset is not empty after filtering
+        if len(self.df) == 0:
+            raise ValueError("Dataset is empty after filtering! No valid sequences remaining.")
+
         # Nucleotide to index mapping for one-hot encoding
         self.nuc_to_idx = {'A': 0, 'C': 1, 'G': 2, 'U': 3}
 
@@ -88,9 +92,17 @@ class RNADataset(Dataset):
             Tensor of shape (len, 4) with one-hot encoding
         """
         encoding = np.zeros((len(sequence), 4), dtype=np.float32)
+        unknown_nucs = set()
         for i, nuc in enumerate(sequence):
             if nuc in self.nuc_to_idx:
                 encoding[i, self.nuc_to_idx[nuc]] = 1.0
+            else:
+                unknown_nucs.add(nuc)
+
+        # Warn about unknown nucleotides
+        if unknown_nucs:
+            print(f"Warning: Unknown nucleotides found: {unknown_nucs} (encoded as zeros)")
+
         return torch.from_numpy(encoding)
 
     def create_contact_matrix(self, base_pairs, seq_len):
@@ -104,18 +116,30 @@ class RNADataset(Dataset):
         Returns:
             Tensor of shape (seq_len, seq_len) with 1s at base pair positions
         """
-        seq_len = int(seq_len)  # Ensure seq_len is an integer
+        # Validate and convert seq_len
+        try:
+            seq_len = int(float(seq_len))  # Handle both int and float strings
+            if seq_len <= 0:
+                raise ValueError(f"seq_len must be positive, got {seq_len}")
+        except (ValueError, TypeError) as e:
+            print(f"Warning: Invalid seq_len '{seq_len}': {e}")
+            return None
+
         matrix = np.zeros((seq_len, seq_len), dtype=np.float32)
 
         try:
             pairs = json.loads(base_pairs)
             for pair in pairs:
                 i, j = pair
+                # Convert from 1-indexed (CSV format) to 0-indexed (Python arrays)
+                i -= 1
+                j -= 1
                 if 0 <= i < seq_len and 0 <= j < seq_len:
                     matrix[i, j] = 1.0
                     matrix[j, i] = 1.0  # Symmetric
         except (json.JSONDecodeError, TypeError, ValueError) as e:
             # Handle malformed base_pairs
+            print(f"Warning: Failed to parse base_pairs (seq_len={seq_len}): {e}")
             pass
 
         return torch.from_numpy(matrix)
@@ -140,6 +164,20 @@ class RNADataset(Dataset):
 
         # Create contact matrix
         contact_matrix = self.create_contact_matrix(base_pairs, seq_len)
+
+        # Skip sample if contact matrix creation failed
+        if contact_matrix is None:
+            # Return a valid empty sample (will be filtered later if needed)
+            # For now, create empty tensors to avoid crashes
+            seq_len = 1
+            contact_matrix = torch.zeros(1, 1)
+            encoded_seq = torch.zeros(1, 4)
+            return {
+                'sequence': encoded_seq,
+                'contact_matrix': contact_matrix,
+                'seq_len': seq_len,
+                'id': seq_id
+            }
 
         # Apply augmentation if enabled
         if self.augment:

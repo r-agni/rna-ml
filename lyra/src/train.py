@@ -168,8 +168,8 @@ class Trainer:
     def update_learning_rate_warmup(self, epoch):
         """Update learning rate during warmup period"""
         if epoch <= self.warmup_epochs and self.warmup_epochs > 0:
-            # Linear warmup
-            warmup_factor = epoch / self.warmup_epochs
+            # Linear warmup (use max(epoch, 1) to avoid 0/warmup_epochs at epoch 0)
+            warmup_factor = max(epoch, 1) / self.warmup_epochs
             lr = self.base_lr * warmup_factor
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
@@ -217,7 +217,7 @@ class Trainer:
             # Only update weights every N batches (gradient accumulation)
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
                 # Gradient clipping
-                grad_norm = 0
+                grad_norm = 0.0
                 if self.config['training']['grad_clip'] > 0:
                     if self.use_amp:
                         self.scaler.unscale_(self.optimizer)
@@ -235,7 +235,7 @@ class Trainer:
 
                 self.optimizer.zero_grad()
             else:
-                grad_norm = 0
+                grad_norm = 0.0
 
             total_loss += loss.item() * self.gradient_accumulation_steps
             batch_count += 1
@@ -262,6 +262,27 @@ class Trainer:
             if self.config['logging']['verbose'] and batch_idx % self.config['logging']['log_interval'] == 0:
                 avg_loss = total_loss / batch_count
                 print(f"\nBatch {batch_idx}/{len(train_loader)} - Loss: {avg_loss:.4f}")
+
+        # Handle remaining gradients if batch count not divisible by accumulation steps
+        if (batch_idx + 1) % self.gradient_accumulation_steps != 0:
+            # Gradient clipping
+            grad_norm = 0.0
+            if self.config['training']['grad_clip'] > 0:
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config['training']['grad_clip']
+                )
+
+            # Optimizer step for accumulated gradients
+            if self.use_amp:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+
+            self.optimizer.zero_grad()
 
         avg_loss = total_loss / batch_count
         return avg_loss
@@ -560,51 +581,40 @@ def main():
     # Train model
     trainer.train(train_loader, val_loader)
 
-    # Test on test set - using validate method for loss calculation
+    # Evaluate on test set using detailed evaluation
     print("\nEvaluating on test set...")
-    test_loss, test_metrics, test_std_metrics = trainer.validate(test_loader, "Test")
-    print(f"\nTest Set Results (from validate method):")
-    print(f"  Test Loss:   {test_loss:.4f}")
-    print(f"  Test F1:     {test_metrics['f1']:.4f} ± {test_std_metrics['f1']:.4f}")
-    print(f"  Test MCC:    {test_metrics['mcc']:.4f} ± {test_std_metrics['mcc']:.4f}")
-    print(f"  Test Exact:  {test_metrics['exact_match']:.4f} ± {test_std_metrics['exact_match']:.4f}")
-
-    # Also run detailed evaluation with precision/recall and save per-sample results
-    print("\nRunning detailed test evaluation...")
-    detailed_metrics = evaluate_model(
+    test_metrics = evaluate_model(
         trainer.model,
         test_loader,
         trainer.device,
         output_dir=config['output']['save_dir']
     )
 
-    print(f"\nDetailed Test Set Results:")
-    print(f"  Test F1:         {detailed_metrics['test_f1']:.4f}")
-    print(f"  Test MCC:        {detailed_metrics['test_mcc']:.4f}")
-    print(f"  Test Precision:  {detailed_metrics['test_precision']:.4f}")
-    print(f"  Test Recall:     {detailed_metrics['test_recall']:.4f}")
-    print(f"  Test Exact:      {detailed_metrics['test_exact_match']:.4f}")
-    print(f"  Total Samples:   {detailed_metrics['test_samples']}")
+    print(f"\nTest Set Results:")
+    print(f"  Test F1:         {test_metrics['test_f1']:.4f}")
+    print(f"  Test MCC:        {test_metrics['test_mcc']:.4f}")
+    print(f"  Test Precision:  {test_metrics['test_precision']:.4f}")
+    print(f"  Test Recall:     {test_metrics['test_recall']:.4f}")
+    print(f"  Test Exact:      {test_metrics['test_exact_match']:.4f}")
+    print(f"  Total Samples:   {test_metrics['test_samples']}")
 
     # Log test metrics to wandb
     if wandb_logger.is_enabled:
-        wandb_logger.log_test_metrics(test_loss, test_metrics, test_std_metrics)
-
-        # Also log additional detailed metrics
         import wandb
         wandb.log({
-            "test/precision": detailed_metrics['test_precision'],
-            "test/recall": detailed_metrics['test_recall'],
-            "test/detailed_f1": detailed_metrics['test_f1'],
-            "test/detailed_mcc": detailed_metrics['test_mcc'],
-            "test/detailed_exact_match": detailed_metrics['test_exact_match']
+            "test/f1": test_metrics['test_f1'],
+            "test/mcc": test_metrics['test_mcc'],
+            "test/precision": test_metrics['test_precision'],
+            "test/recall": test_metrics['test_recall'],
+            "test/exact_match": test_metrics['test_exact_match']
         })
 
-        # Update wandb summary with detailed metrics
-        wandb.run.summary["final_test_precision"] = detailed_metrics['test_precision']
-        wandb.run.summary["final_test_recall"] = detailed_metrics['test_recall']
-        wandb.run.summary["final_test_f1"] = detailed_metrics['test_f1']
-        wandb.run.summary["final_test_mcc"] = detailed_metrics['test_mcc']
+        # Update wandb summary with test metrics
+        wandb.run.summary["final_test_f1"] = test_metrics['test_f1']
+        wandb.run.summary["final_test_mcc"] = test_metrics['test_mcc']
+        wandb.run.summary["final_test_precision"] = test_metrics['test_precision']
+        wandb.run.summary["final_test_recall"] = test_metrics['test_recall']
+        wandb.run.summary["final_test_exact_match"] = test_metrics['test_exact_match']
 
         wandb_logger.finish()
 
