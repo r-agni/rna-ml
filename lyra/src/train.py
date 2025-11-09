@@ -11,6 +11,8 @@ from sklearn.metrics import f1_score, matthews_corrcoef
 from .model import create_lyra_model
 from .data_loader import get_data_loaders
 from .wandb_logging import WandBLogger
+from .focal_loss import FocalLoss, CombinedLoss, WeightedBCEWithLogitsLoss
+from .evaluate import evaluate_model
 
 
 class MetricsCalculator:
@@ -87,10 +89,29 @@ class Trainer:
         num_params = sum(p.numel() for p in self.model.parameters())
         print(f"Model created with {num_params} parameters")
 
-        # Loss function with positive class weighting
-        # Cache pos_weight tensor for reuse in masked loss calculation
-        self.pos_weight = torch.tensor([config['training']['pos_weight']]).to(self.device)
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        # Loss function - choose based on config
+        loss_type = config['training'].get('loss_type', 'focal')
+
+        if loss_type == 'focal':
+            # Focal Loss - best for extreme class imbalance
+            focal_alpha = config['training'].get('focal_alpha', 0.25)
+            focal_gamma = config['training'].get('focal_gamma', 2.0)
+            self.criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none')
+            print(f"Using Focal Loss (alpha={focal_alpha}, gamma={focal_gamma})")
+        elif loss_type == 'combined':
+            # Combined Focal + Dice Loss
+            focal_alpha = config['training'].get('focal_alpha', 0.25)
+            focal_gamma = config['training'].get('focal_gamma', 2.0)
+            dice_weight = config['training'].get('dice_weight', 0.3)
+            self.criterion = CombinedLoss(focal_alpha=focal_alpha, focal_gamma=focal_gamma, dice_weight=dice_weight)
+            print(f"Using Combined Focal+Dice Loss (alpha={focal_alpha}, gamma={focal_gamma}, dice_weight={dice_weight})")
+        else:
+            # BCE with pos_weight (original)
+            self.pos_weight = torch.tensor([config['training']['pos_weight']]).to(self.device)
+            self.criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight, reduction='none')
+            print(f"Using BCE Loss (pos_weight={config['training']['pos_weight']})")
+
+        self.loss_type = loss_type
 
         # Optimizer
         self.optimizer = optim.Adam(
@@ -168,23 +189,21 @@ class Trainer:
             contact_matrices = batch['contact_matrix'].to(self.device)
             seq_lens = batch['seq_len'].to(self.device)
 
+            # Create mask for valid positions (exclude padding) - OUTSIDE autocast
+            max_len = contact_matrices.shape[1]
+            mask = torch.zeros_like(contact_matrices)
+            for i, length in enumerate(seq_lens):
+                mask[i, :length, :length] = 1.0
+
             # Forward pass with AMP if enabled
             with torch.cuda.amp.autocast(enabled=self.use_amp):
                 pred_contacts = self.model(sequences, seq_lens)
 
-                # Create mask for valid positions (exclude padding)
-                max_len = contact_matrices.shape[1]
-                mask = torch.zeros_like(contact_matrices)
-                for i, length in enumerate(seq_lens):
-                    mask[i, :length, :length] = 1.0
-
                 # Calculate masked loss (only on valid positions)
-                loss_unreduced = nn.functional.binary_cross_entropy_with_logits(
-                    pred_contacts, contact_matrices,
-                    pos_weight=self.pos_weight,
-                    reduction='none'
-                )
-                loss = (loss_unreduced * mask).sum() / mask.sum()
+                # Standardized approach: compute loss first, then mask
+                loss_unreduced = self.criterion(pred_contacts, contact_matrices)
+                # Apply mask and average (consistent for all loss types)
+                loss = (loss_unreduced * mask).sum() / (mask.sum() + 1e-8)
 
             # Scale loss for gradient accumulation
             loss = loss / self.gradient_accumulation_steps
@@ -221,8 +240,12 @@ class Trainer:
             total_loss += loss.item() * self.gradient_accumulation_steps
             batch_count += 1
 
-            # Update progress bar
-            pbar.set_postfix({'loss': f"{loss.item() * self.gradient_accumulation_steps:.4f}"})
+            # Update progress bar with detailed info
+            current_loss = loss.item() * self.gradient_accumulation_steps
+            pbar.set_postfix({
+                'loss': f"{current_loss:.4f}",
+                'avg': f"{total_loss/batch_count:.4f}"
+            })
 
             # Log to wandb per batch
             if self.wandb_logger and self.wandb_logger.is_enabled:
@@ -259,23 +282,21 @@ class Trainer:
                 contact_matrices = batch['contact_matrix'].to(self.device)
                 seq_lens = batch['seq_len'].to(self.device)
 
+                # Create mask for valid positions (exclude padding) - OUTSIDE autocast
+                max_len = contact_matrices.shape[1]
+                mask = torch.zeros_like(contact_matrices)
+                for i, length in enumerate(seq_lens):
+                    mask[i, :length, :length] = 1.0
+
                 # Forward pass with AMP if enabled
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
                     pred_contacts = self.model(sequences, seq_lens)
 
-                    # Create mask for valid positions (exclude padding)
-                    max_len = contact_matrices.shape[1]
-                    mask = torch.zeros_like(contact_matrices)
-                    for i, length in enumerate(seq_lens):
-                        mask[i, :length, :length] = 1.0
-
                     # Calculate masked loss (only on valid positions)
-                    loss_unreduced = nn.functional.binary_cross_entropy_with_logits(
-                        pred_contacts, contact_matrices,
-                        pos_weight=self.pos_weight,
-                        reduction='none'
-                    )
-                    loss = (loss_unreduced * mask).sum() / mask.sum()
+                    # Calculate masked loss (standardized approach)
+                    loss_unreduced = self.criterion(pred_contacts, contact_matrices)
+                    # Apply mask and average (consistent for all loss types)
+                    loss = (loss_unreduced * mask).sum() / (mask.sum() + 1e-8)
 
                 total_loss += loss.item()
                 batch_count += 1
@@ -539,18 +560,52 @@ def main():
     # Train model
     trainer.train(train_loader, val_loader)
 
-    # Test on test set
+    # Test on test set - using validate method for loss calculation
     print("\nEvaluating on test set...")
     test_loss, test_metrics, test_std_metrics = trainer.validate(test_loader, "Test")
-    print(f"\nTest Set Results:")
+    print(f"\nTest Set Results (from validate method):")
     print(f"  Test Loss:   {test_loss:.4f}")
     print(f"  Test F1:     {test_metrics['f1']:.4f} ± {test_std_metrics['f1']:.4f}")
     print(f"  Test MCC:    {test_metrics['mcc']:.4f} ± {test_std_metrics['mcc']:.4f}")
     print(f"  Test Exact:  {test_metrics['exact_match']:.4f} ± {test_std_metrics['exact_match']:.4f}")
-    
+
+    # Also run detailed evaluation with precision/recall and save per-sample results
+    print("\nRunning detailed test evaluation...")
+    detailed_metrics = evaluate_model(
+        trainer.model,
+        test_loader,
+        trainer.device,
+        output_dir=config['output']['save_dir']
+    )
+
+    print(f"\nDetailed Test Set Results:")
+    print(f"  Test F1:         {detailed_metrics['test_f1']:.4f}")
+    print(f"  Test MCC:        {detailed_metrics['test_mcc']:.4f}")
+    print(f"  Test Precision:  {detailed_metrics['test_precision']:.4f}")
+    print(f"  Test Recall:     {detailed_metrics['test_recall']:.4f}")
+    print(f"  Test Exact:      {detailed_metrics['test_exact_match']:.4f}")
+    print(f"  Total Samples:   {detailed_metrics['test_samples']}")
+
     # Log test metrics to wandb
     if wandb_logger.is_enabled:
         wandb_logger.log_test_metrics(test_loss, test_metrics, test_std_metrics)
+
+        # Also log additional detailed metrics
+        import wandb
+        wandb.log({
+            "test/precision": detailed_metrics['test_precision'],
+            "test/recall": detailed_metrics['test_recall'],
+            "test/detailed_f1": detailed_metrics['test_f1'],
+            "test/detailed_mcc": detailed_metrics['test_mcc'],
+            "test/detailed_exact_match": detailed_metrics['test_exact_match']
+        })
+
+        # Update wandb summary with detailed metrics
+        wandb.run.summary["final_test_precision"] = detailed_metrics['test_precision']
+        wandb.run.summary["final_test_recall"] = detailed_metrics['test_recall']
+        wandb.run.summary["final_test_f1"] = detailed_metrics['test_f1']
+        wandb.run.summary["final_test_mcc"] = detailed_metrics['test_mcc']
+
         wandb_logger.finish()
 
 

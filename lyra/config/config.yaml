@@ -56,7 +56,15 @@ training:
   gradient_accumulation_steps: 1  # Accumulate gradients over N batches
 
   # Loss function
-  pos_weight: 5.0  # Reduced from 10.0 for deduplicated data
+  loss_type: "focal"  # Options: "focal", "combined", "bce"
+  pos_weight: 5.0  # Only used if loss_type="bce"
+
+  # Focal Loss parameters (used if loss_type="focal" or "combined")
+  focal_alpha: 0.25  # Weight for positive class (0.25 = 25% weight to positives)
+  focal_gamma: 2.0  # Focusing parameter (higher = more focus on hard examples)
+
+  # Combined Loss parameters (used if loss_type="combined")
+  dice_weight: 0.5  # Weight for dice loss component
 
   # Learning rate scheduler with warmup
   warmup_epochs: 3  # Number of epochs for linear warmup
