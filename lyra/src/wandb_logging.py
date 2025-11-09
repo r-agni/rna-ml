@@ -72,7 +72,7 @@ class WandBLogger:
             }
         )
         
-        print(f"\n✓ Weights & Biases initialized")
+        print(f"\nWeights & Biases initialized")
         print(f"  Project: {wandb.run.project}")
         print(f"  Run: {wandb.run.name}")
         print(f"  URL: {wandb.run.url}")

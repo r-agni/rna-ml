@@ -22,16 +22,22 @@ data:
 
 # Data loading
 dataloader:
-  batch_size: 16
-  num_workers: 0
+  batch_size: 32  # Increased from 16 for better GPU utilization
+  num_workers: 4  # Parallel data loading (4 CPU cores)
   pin_memory: true
+  prefetch_factor: 2  # Prefetch 2 batches per worker
+  persistent_workers: true  # Keep workers alive between epochs
+  deduplicate: true  # Prevent data leakage by splitting on unique sequences
+  augment: true  # Enable data augmentation for training
+  augment_prob: 0.5  # Probability of applying augmentation
 
 # Model architecture
 model:
-  model_dimension: 128
+  model_dimension: 256  # Increased from 128 for better capacity
   pgc_configs:
-    - [2.0, 2]  # (expansion_factor, num_layers)
-  num_s4: 4
+    - [2.0, 3]  # (expansion_factor, num_layers)
+    - [2.0, 2]
+  num_s4: 6  # Increased from 4 for better capacity
   d_input: 4  # One-hot encoding for A, C, G, U
   dropout: 0.2
   prenorm: true
@@ -45,10 +51,15 @@ training:
   grad_clip: 1.0
   early_stopping_patience: 10
 
-  # Loss function
-  pos_weight: 10.0  # Weight for positive class (base pairs are sparse)
+  # Performance optimizations
+  use_amp: true  # Automatic Mixed Precision (faster training, less memory)
+  gradient_accumulation_steps: 1  # Accumulate gradients over N batches
 
-  # Learning rate scheduler
+  # Loss function
+  pos_weight: 5.0  # Reduced from 10.0 for deduplicated data
+
+  # Learning rate scheduler with warmup
+  warmup_epochs: 3  # Number of epochs for linear warmup
   scheduler:
     type: "ReduceLROnPlateau"
     mode: "max"

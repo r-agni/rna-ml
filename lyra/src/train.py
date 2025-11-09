@@ -98,6 +98,22 @@ class Trainer:
             weight_decay=config['training']['weight_decay']
         )
 
+        # Warmup configuration
+        self.warmup_epochs = config['training'].get('warmup_epochs', 0)
+        self.base_lr = config['training']['learning_rate']
+        self.current_epoch = 0
+
+        # Performance optimizations
+        self.use_amp = config['training'].get('use_amp', False)
+        self.gradient_accumulation_steps = config['training'].get('gradient_accumulation_steps', 1)
+
+        # Mixed precision scaler
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        if self.use_amp:
+            print(f"Using Automatic Mixed Precision (AMP) for faster training")
+        if self.gradient_accumulation_steps > 1:
+            print(f"Using gradient accumulation: {self.gradient_accumulation_steps} steps")
+
         # Learning rate scheduler
         scheduler_config = config['training']['scheduler']
         if scheduler_config['type'] == 'ReduceLROnPlateau':
@@ -127,6 +143,17 @@ class Trainer:
                 self.model, self.criterion, num_params, self.device
             )
 
+    def update_learning_rate_warmup(self, epoch):
+        """Update learning rate during warmup period"""
+        if epoch <= self.warmup_epochs and self.warmup_epochs > 0:
+            # Linear warmup
+            warmup_factor = epoch / self.warmup_epochs
+            lr = self.base_lr * warmup_factor
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+            return True
+        return False
+
     def train_epoch(self, train_loader, epoch):
         """Train for one epoch"""
         self.model.train()
@@ -140,39 +167,56 @@ class Trainer:
             contact_matrices = batch['contact_matrix'].to(self.device)
             seq_lens = batch['seq_len'].to(self.device)
 
-            # Forward pass
-            self.optimizer.zero_grad()
-            pred_contacts = self.model(sequences, seq_lens)
+            # Forward pass with AMP if enabled
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                pred_contacts = self.model(sequences, seq_lens)
+                loss = self.criterion(pred_contacts, contact_matrices)
 
-            # Calculate loss (using logits)
-            loss = self.criterion(pred_contacts, contact_matrices)
+            # Scale loss for gradient accumulation
+            loss = loss / self.gradient_accumulation_steps
 
             # Backward pass
-            loss.backward()
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
-            # Gradient clipping
-            grad_norm = 0
-            if self.config['training']['grad_clip'] > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config['training']['grad_clip']
-                )
+            # Only update weights every N batches (gradient accumulation)
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                # Gradient clipping
+                grad_norm = 0
+                if self.config['training']['grad_clip'] > 0:
+                    if self.use_amp:
+                        self.scaler.unscale_(self.optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config['training']['grad_clip']
+                    )
 
-            self.optimizer.step()
+                # Optimizer step
+                if self.use_amp:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
 
-            total_loss += loss.item()
+                self.optimizer.zero_grad()
+            else:
+                grad_norm = 0
+
+            total_loss += loss.item() * self.gradient_accumulation_steps
             batch_count += 1
 
             # Update progress bar
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
-            
+            pbar.set_postfix({'loss': f"{loss.item() * self.gradient_accumulation_steps:.4f}"})
+
             # Log to wandb per batch
             if self.wandb_logger and self.wandb_logger.is_enabled:
                 self.wandb_logger.log_batch_metrics(
                     epoch=epoch,
                     batch_idx=batch_idx,
                     total_batches=len(train_loader),
-                    loss=loss.item(),
+                    loss=loss.item() * self.gradient_accumulation_steps,
                     grad_norm=grad_norm,
                     learning_rate=self.optimizer.param_groups[0]['lr']
                 )
@@ -201,11 +245,11 @@ class Trainer:
                 contact_matrices = batch['contact_matrix'].to(self.device)
                 seq_lens = batch['seq_len'].to(self.device)
 
-                # Forward pass
-                pred_contacts = self.model(sequences, seq_lens)
+                # Forward pass with AMP if enabled
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    pred_contacts = self.model(sequences, seq_lens)
+                    loss = self.criterion(pred_contacts, contact_matrices)
 
-                # Calculate loss
-                loss = self.criterion(pred_contacts, contact_matrices)
                 total_loss += loss.item()
                 batch_count += 1
 
@@ -305,6 +349,11 @@ class Trainer:
             print(f"Epoch {epoch}/{num_epochs}")
             print(f"{'=' * 60}")
 
+            # Apply warmup if in warmup period
+            in_warmup = self.update_learning_rate_warmup(epoch)
+            if in_warmup:
+                print(f"  Warmup: LR = {self.optimizer.param_groups[0]['lr']:.6f}")
+
             # Train
             train_loss = self.train_epoch(train_loader, epoch)
             self.train_losses.append(train_loss)
@@ -366,16 +415,18 @@ class Trainer:
                 # Save periodic checkpoints and best model
                 self.save_checkpoint(epoch, current_metric, is_best=is_best, periodic=is_periodic)
 
-            # Learning rate scheduler
-            if self.scheduler is not None:
+            # Learning rate scheduler (only apply after warmup)
+            if self.scheduler is not None and not in_warmup:
                 prev_lr = current_lr
                 self.scheduler.step(current_metric)
                 current_lr = self.optimizer.param_groups[0]['lr']
                 print(f"  Learning Rate: {current_lr:.6f}")
-                
+
                 # Log LR change to wandb
                 if self.wandb_logger and self.wandb_logger.is_enabled and current_lr != prev_lr:
                     self.wandb_logger.log_lr_reduction(epoch, current_lr)
+            elif not in_warmup:
+                print(f"  Learning Rate: {current_lr:.6f}")
 
             # Early stopping
             if self.epochs_without_improvement >= patience:
@@ -443,7 +494,12 @@ def main():
         train_ratio=config['data']['train_ratio'],
         val_ratio=config['data']['val_ratio'],
         test_ratio=config['data']['test_ratio'],
-        random_seed=config['data']['random_seed']
+        random_seed=config['data']['random_seed'],
+        deduplicate=config['dataloader'].get('deduplicate', True),
+        augment=config['dataloader'].get('augment', False),
+        augment_prob=config['dataloader'].get('augment_prob', 0.5),
+        prefetch_factor=config['dataloader'].get('prefetch_factor', 2),
+        persistent_workers=config['dataloader'].get('persistent_workers', False)
     )
     
     # Log dataset info to wandb
