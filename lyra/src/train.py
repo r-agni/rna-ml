@@ -88,8 +88,9 @@ class Trainer:
         print(f"Model created with {num_params} parameters")
 
         # Loss function with positive class weighting
-        pos_weight = torch.tensor([config['training']['pos_weight']]).to(self.device)
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        # Cache pos_weight tensor for reuse in masked loss calculation
+        self.pos_weight = torch.tensor([config['training']['pos_weight']]).to(self.device)
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
 
         # Optimizer
         self.optimizer = optim.Adam(
@@ -170,7 +171,20 @@ class Trainer:
             # Forward pass with AMP if enabled
             with torch.cuda.amp.autocast(enabled=self.use_amp):
                 pred_contacts = self.model(sequences, seq_lens)
-                loss = self.criterion(pred_contacts, contact_matrices)
+
+                # Create mask for valid positions (exclude padding)
+                max_len = contact_matrices.shape[1]
+                mask = torch.zeros_like(contact_matrices)
+                for i, length in enumerate(seq_lens):
+                    mask[i, :length, :length] = 1.0
+
+                # Calculate masked loss (only on valid positions)
+                loss_unreduced = nn.functional.binary_cross_entropy_with_logits(
+                    pred_contacts, contact_matrices,
+                    pos_weight=self.pos_weight,
+                    reduction='none'
+                )
+                loss = (loss_unreduced * mask).sum() / mask.sum()
 
             # Scale loss for gradient accumulation
             loss = loss / self.gradient_accumulation_steps
@@ -248,7 +262,20 @@ class Trainer:
                 # Forward pass with AMP if enabled
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
                     pred_contacts = self.model(sequences, seq_lens)
-                    loss = self.criterion(pred_contacts, contact_matrices)
+
+                    # Create mask for valid positions (exclude padding)
+                    max_len = contact_matrices.shape[1]
+                    mask = torch.zeros_like(contact_matrices)
+                    for i, length in enumerate(seq_lens):
+                        mask[i, :length, :length] = 1.0
+
+                    # Calculate masked loss (only on valid positions)
+                    loss_unreduced = nn.functional.binary_cross_entropy_with_logits(
+                        pred_contacts, contact_matrices,
+                        pos_weight=self.pos_weight,
+                        reduction='none'
+                    )
+                    loss = (loss_unreduced * mask).sum() / mask.sum()
 
                 total_loss += loss.item()
                 batch_count += 1
