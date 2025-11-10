@@ -86,6 +86,10 @@ checkpoint:
 # Device
 device: "cuda"  # "cuda" or "cpu"
 
+# Output
+output:
+  save_dir: "lyra/output/results"  # Directory for test results and evaluation outputs
+
 # Logging
 logging:
   log_interval: 100  # Log every N batches

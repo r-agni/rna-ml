@@ -88,6 +88,9 @@ def evaluate_model(model, test_loader, device, output_dir=None):
                 total_samples += 1
 
     # Calculate aggregate metrics
+    if total_samples == 0:
+        raise ValueError("Test loader is empty - no samples to evaluate")
+
     all_preds = np.array(all_preds)
     all_trues = np.array(all_trues)
 

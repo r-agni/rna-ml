@@ -60,6 +60,9 @@ class MetricsCalculator:
                 exact_matches += 1
 
         # Calculate metrics
+        if batch_size == 0:
+            raise ValueError("Cannot calculate metrics on empty batch - batch_size is 0")
+
         all_preds = np.array(all_preds)
         all_trues = np.array(all_trues)
 
@@ -130,7 +133,7 @@ class Trainer:
         self.gradient_accumulation_steps = config['training'].get('gradient_accumulation_steps', 1)
 
         # Mixed precision scaler
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
         if self.use_amp:
             print(f"Using Automatic Mixed Precision (AMP) for faster training")
         if self.gradient_accumulation_steps > 1:
@@ -196,14 +199,22 @@ class Trainer:
                 mask[i, :length, :length] = 1.0
 
             # Forward pass with AMP if enabled
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
                 pred_contacts = self.model(sequences, seq_lens)
 
                 # Calculate masked loss (only on valid positions)
+                # Validate mask has valid positions
+                mask_sum = mask.sum()
+                if mask_sum == 0:
+                    raise ValueError(
+                        "All sequences in batch have zero length - invalid mask. "
+                        "This indicates a data loading issue."
+                    )
+
                 # Standardized approach: compute loss first, then mask
                 loss_unreduced = self.criterion(pred_contacts, contact_matrices)
                 # Apply mask and average (consistent for all loss types)
-                loss = (loss_unreduced * mask).sum() / (mask.sum() + 1e-8)
+                loss = (loss_unreduced * mask).sum() / mask_sum
 
             # Scale loss for gradient accumulation
             loss = loss / self.gradient_accumulation_steps
@@ -284,6 +295,9 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
+        if batch_count == 0:
+            raise ValueError("Training loader is empty - no batches to train on")
+
         avg_loss = total_loss / batch_count
         return avg_loss
 
@@ -310,14 +324,22 @@ class Trainer:
                     mask[i, :length, :length] = 1.0
 
                 # Forward pass with AMP if enabled
-                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
                     pred_contacts = self.model(sequences, seq_lens)
 
                     # Calculate masked loss (only on valid positions)
+                    # Validate mask has valid positions
+                    mask_sum = mask.sum()
+                    if mask_sum == 0:
+                        raise ValueError(
+                            "All sequences in batch have zero length - invalid mask. "
+                            "This indicates a data loading issue."
+                        )
+
                     # Calculate masked loss (standardized approach)
                     loss_unreduced = self.criterion(pred_contacts, contact_matrices)
                     # Apply mask and average (consistent for all loss types)
-                    loss = (loss_unreduced * mask).sum() / (mask.sum() + 1e-8)
+                    loss = (loss_unreduced * mask).sum() / mask_sum
 
                 total_loss += loss.item()
                 batch_count += 1
@@ -338,6 +360,9 @@ class Trainer:
                 })
 
         # Average metrics
+        if batch_count == 0:
+            raise ValueError("Validation loader is empty - no batches to validate on")
+
         avg_loss = total_loss / batch_count
         avg_metrics = {key: np.mean(values) for key, values in all_metrics.items()}
         

@@ -44,8 +44,28 @@ class RNADataset(Dataset):
         # Nucleotide to index mapping for one-hot encoding
         self.nuc_to_idx = {'A': 0, 'C': 1, 'G': 2, 'U': 3}
 
-        # Reverse complement mapping for RNA
-        self.complement = {'A': 'U', 'U': 'A', 'C': 'G', 'G': 'C'}
+        # IUPAC ambiguity codes - encoded as probability distributions
+        # Format: {code: [P(A), P(C), P(G), P(U)]}
+        self.ambiguity_codes = {
+            'N': [0.25, 0.25, 0.25, 0.25],  # Any nucleotide
+            'Y': [0.0, 0.5, 0.0, 0.5],      # Pyrimidine (C or U)
+            'R': [0.5, 0.0, 0.5, 0.0],      # Purine (A or G)
+            'W': [0.5, 0.0, 0.0, 0.5],      # Weak (A or U)
+            'S': [0.0, 0.5, 0.5, 0.0],      # Strong (C or G)
+            'K': [0.0, 0.0, 0.5, 0.5],      # Keto (G or U)
+            'M': [0.5, 0.5, 0.0, 0.0],      # Amino (A or C)
+            'B': [0.0, 0.33, 0.33, 0.33],   # Not A (C, G, U)
+            'D': [0.33, 0.0, 0.33, 0.33],   # Not C (A, G, U)
+            'H': [0.33, 0.33, 0.0, 0.33],   # Not G (A, C, U)
+            'V': [0.33, 0.33, 0.33, 0.0],   # Not U (A, C, G)
+        }
+
+        # Reverse complement mapping for RNA (including ambiguity codes)
+        self.complement = {
+            'A': 'U', 'U': 'A', 'C': 'G', 'G': 'C',
+            'N': 'N', 'Y': 'R', 'R': 'Y', 'W': 'W', 'S': 'S',
+            'K': 'M', 'M': 'K', 'B': 'V', 'D': 'H', 'H': 'D', 'V': 'B'
+        }
 
     def __len__(self):
         return len(self.df)
@@ -81,37 +101,49 @@ class RNADataset(Dataset):
 
         return sequence, contact_matrix
 
-    def encode_sequence(self, sequence):
+    def encode_sequence(self, sequence, seq_id="unknown"):
         """
-        One-hot encode RNA sequence.
+        One-hot encode RNA sequence with support for IUPAC ambiguity codes.
 
         Args:
-            sequence: String of nucleotides (A, C, G, U)
+            sequence: String of nucleotides (A, C, G, U) and IUPAC ambiguity codes
+            seq_id: Sample ID for error reporting
 
         Returns:
             Tensor of shape (len, 4) with one-hot encoding
+            Note: Ambiguity codes are encoded as probability distributions
+                  (e.g., Y=[0, 0.5, 0, 0.5] for C or U)
         """
         encoding = np.zeros((len(sequence), 4), dtype=np.float32)
         unknown_nucs = set()
         for i, nuc in enumerate(sequence):
             if nuc in self.nuc_to_idx:
+                # Standard one-hot encoding for known nucleotides
                 encoding[i, self.nuc_to_idx[nuc]] = 1.0
+            elif nuc in self.ambiguity_codes:
+                # IUPAC ambiguity code: use probability distribution
+                encoding[i, :] = self.ambiguity_codes[nuc]
             else:
                 unknown_nucs.add(nuc)
 
-        # Warn about unknown nucleotides
+        # Raise exception for unknown nucleotides
         if unknown_nucs:
-            print(f"Warning: Unknown nucleotides found: {unknown_nucs} (encoded as zeros)")
+            valid_codes = "A, C, G, U, " + ", ".join(sorted(self.ambiguity_codes.keys()))
+            raise ValueError(
+                f"Invalid nucleotides found in sequence '{seq_id}': {sorted(unknown_nucs)}. "
+                f"Only the following codes are allowed: {valid_codes}"
+            )
 
         return torch.from_numpy(encoding)
 
-    def create_contact_matrix(self, base_pairs, seq_len):
+    def create_contact_matrix(self, base_pairs, seq_len, seq_id="unknown"):
         """
         Create contact matrix from base pairs.
 
         Args:
             base_pairs: JSON string of [[i, j], ...] pairs
             seq_len: Length of the sequence
+            seq_id: Sample ID for error reporting
 
         Returns:
             Tensor of shape (seq_len, seq_len) with 1s at base pair positions
@@ -121,9 +153,14 @@ class RNADataset(Dataset):
             seq_len = int(float(seq_len))  # Handle both int and float strings
             if seq_len <= 0:
                 raise ValueError(f"seq_len must be positive, got {seq_len}")
+            # Ensure seq_len is exactly an integer (not truncated from float)
+            if float(seq_len) != int(seq_len):
+                raise ValueError(f"seq_len must be an integer, got {float(seq_len)}")
         except (ValueError, TypeError) as e:
-            print(f"Warning: Invalid seq_len '{seq_len}': {e}")
-            return None
+            raise ValueError(
+                f"Invalid seq_len for sequence '{seq_id}': {seq_len}. "
+                f"seq_len must be a positive integer. Error: {e}"
+            )
 
         matrix = np.zeros((seq_len, seq_len), dtype=np.float32)
 
@@ -138,9 +175,11 @@ class RNADataset(Dataset):
                     matrix[i, j] = 1.0
                     matrix[j, i] = 1.0  # Symmetric
         except (json.JSONDecodeError, TypeError, ValueError) as e:
-            # Handle malformed base_pairs
-            print(f"Warning: Failed to parse base_pairs (seq_len={seq_len}): {e}")
-            pass
+            # Raise exception for malformed base_pairs
+            raise ValueError(
+                f"Failed to parse base_pairs for sequence '{seq_id}' (seq_len={seq_len}). "
+                f"Expected JSON array of [i, j] integer pairs. Error: {e}"
+            )
 
         return torch.from_numpy(matrix)
 
@@ -162,29 +201,22 @@ class RNADataset(Dataset):
         base_pairs = row['base_pairs']
         seq_id = row['id']
 
-        # Create contact matrix
-        contact_matrix = self.create_contact_matrix(base_pairs, seq_len)
+        # Create contact matrix (will raise ValueError if invalid)
+        contact_matrix = self.create_contact_matrix(base_pairs, seq_len, seq_id)
 
-        # Skip sample if contact matrix creation failed
-        if contact_matrix is None:
-            # Return a valid empty sample (will be filtered later if needed)
-            # For now, create empty tensors to avoid crashes
-            seq_len = 1
-            contact_matrix = torch.zeros(1, 1)
-            encoded_seq = torch.zeros(1, 4)
-            return {
-                'sequence': encoded_seq,
-                'contact_matrix': contact_matrix,
-                'seq_len': seq_len,
-                'id': seq_id
-            }
+        # Validate minimum sequence length for contact prediction
+        if seq_len < 2:
+            raise ValueError(
+                f"Sequence '{seq_id}' has length {seq_len}, but minimum length "
+                f"of 2 is required for contact prediction."
+            )
 
         # Apply augmentation if enabled
         if self.augment:
             sequence, contact_matrix = self.apply_augmentation(sequence, contact_matrix)
 
-        # Encode sequence
-        encoded_seq = self.encode_sequence(sequence)
+        # Encode sequence (will raise ValueError if invalid nucleotides)
+        encoded_seq = self.encode_sequence(sequence, seq_id)
 
         return {
             'sequence': encoded_seq,
@@ -205,6 +237,10 @@ def collate_fn(batch):
     Returns:
         dict with batched and padded tensors
     """
+    # Check for empty batch
+    if len(batch) == 0:
+        raise ValueError("Cannot collate empty batch - batch is empty")
+
     # Find max length in batch (ensure it's an integer)
     max_len = int(max(sample['seq_len'] for sample in batch))
 

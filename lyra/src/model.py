@@ -203,9 +203,11 @@ class LyraRNAContactPredictor(nn.Module):
             nn.ReLU()
         )
 
-        # Final contact prediction: outer product followed by conv
+        # Final contact prediction: pairwise features followed by conv
+        # Input will be 2 * (model_dimension // 4) = model_dimension // 2 channels
+        in_channels = model_dimension // 2
         self.contact_predictor = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv2d(16, 8, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -249,14 +251,20 @@ class LyraRNAContactPredictor(nn.Module):
         # Contact prediction
         x = self.contact_head(x)  # (B, L, d_model//4)
 
-        # Create contact map via outer product
+        # Create contact map via pairwise feature combination
         # Reshape to (B, L, 1, d) and (B, 1, L, d) for broadcasting
         x1 = x.unsqueeze(2)  # (B, L, 1, d)
         x2 = x.unsqueeze(1)  # (B, 1, L, d)
 
-        # Concatenate and reduce
-        contact_features = (x1 * x2).sum(dim=-1, keepdim=True)  # (B, L, L, 1)
-        contact_features = contact_features.permute(0, 3, 1, 2)  # (B, 1, L, L)
+        # Concatenate pairwise features instead of dot product
+        # This allows the model to learn arbitrary pairwise interactions
+        contact_features = torch.cat([
+            x1.expand(-1, -1, seq_len, -1),  # (B, L, L, d)
+            x2.expand(-1, seq_len, -1, -1)   # (B, L, L, d)
+        ], dim=-1)  # (B, L, L, 2*d)
+
+        # Permute to channel-first format for conv layers
+        contact_features = contact_features.permute(0, 3, 1, 2)  # (B, 2*d, L, L)
 
         # Apply convolutional layers
         contact_map = self.contact_predictor(contact_features)  # (B, 1, L, L)

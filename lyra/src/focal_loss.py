@@ -192,12 +192,16 @@ class CombinedLoss(nn.Module):
             targets: Ground truth binary labels (B, L, L)
 
         Returns:
-            Combined loss value (element-wise for focal, scalar for dice)
+            Combined loss value (element-wise)
         """
         # Focal loss returns element-wise loss (B, L, L) with reduction='none'
         focal = self.focal_loss(inputs, targets)
         # Dice loss returns scalar
         dice = self.dice_loss(inputs, targets)
 
-        # Return element-wise focal + scalar dice (broadcasting adds dice to all elements)
-        return focal + self.dice_weight * dice
+        # Combine losses: broadcast dice loss to match focal loss shape
+        # This ensures dice loss contributes meaningfully regardless of tensor size
+        dice_broadcast = (self.dice_weight * dice) * torch.ones_like(focal)
+
+        # Return element-wise loss
+        return focal + dice_broadcast
