@@ -40,6 +40,7 @@ models/checkpoints/*.pt
 
 # Large dataset files
 lyra/dataset.csv
+Lyra2.0/dataset.csv
 
 # Logs
 *.log
